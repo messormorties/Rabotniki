@@ -77,13 +77,26 @@ void MainWindow::onEmployerSelected(int ind) {
    if (ind>=0 &&ind <rabotniki.size()) {
        auto rab = rabotniki[ind];
        ui->Name->setText(rab->Getname());
-      // QString age = QString::number(rab->Getage());
-       //QString exp = QString::number(rab->Getexp());
        ui->Age->setValue(rab->Getage());
        ui->Gender->setCurrentText(rab->Getgender());
        ui->Exp->setValue(rab->Getexp());
        ui->Number->setText(rab->Getnumber());
    }
+}
+
+unsigned int CRC32_function(const QByteArray &data) {
+    unsigned long crc_table[256];
+    unsigned long crc;
+    for (int i = 0; i < 256; i++) {
+        crc = i;
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+        crc_table[i] = crc;
+    }
+    crc = 0xFFFFFFFFUL;
+    for (uchar byte : data)
+        crc = crc_table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFUL;
 }
 
 void MainWindow::saveToFile() {
@@ -96,45 +109,35 @@ void MainWindow::saveToFile() {
         return;
     }
 
-    QDataStream out(&file);
-    out<<rabotniki.size();
-    QByteArray fileData;
-    for (const auto rab : rabotniki) {
-        QString name = rab->Getname();
-        QString gender = rab->Getgender();
-        int age = rab->Getage();
-        int experience = rab->Getexp();
-        QString phone = rab->Getnumber();
+    QByteArray allData;
+    int size = rabotniki.size();
+    allData.append(reinterpret_cast<const char*>(&size), sizeof(size));
 
-        QByteArray XorData;
-        QDataStream tempStream(&XorData, QIODevice::WriteOnly);
-        tempStream << name << gender << age << experience << phone;
-        for (char &byte : XorData) {
-            byte ^=number;
-        }
-        out<<XorData;
-        fileData.append(XorData);
+    for (const auto &rab : rabotniki) {
+        QByteArray data;
+        data.append(rab->Getname().toUtf8() + '\0');
+        data.append(rab->Getgender().toUtf8() + '\0');
+        data.append(QString::number(rab->Getage()).toUtf8() + '\0');
+        data.append(QString::number(rab->Getexp()).toUtf8() + '\0');
+        data.append(rab->Getnumber().toUtf8() + '\0');
+
+        for (char &byte : data) byte ^= number;
+
+        int length = data.size();
+        allData.append(reinterpret_cast<const char*>(&length), sizeof(length));
+        allData.append(data);
     }
 
+    file.write(allData);
     file.close();
 
-    QFile readFile(FileName);
-    if (!readFile.open(QIODevice::ReadOnly)) return;
-    qint32 summa = 0;
-    QByteArray data = readFile.readAll();
-
-    for (char byte : data) {
-        summa+=static_cast<unsigned char>(byte);
+    unsigned int crc = CRC32_function(allData);
+    ui->ControlSum->setText(QString("CRC32: %1").arg(crc, 8, 16, QChar('0')).toUpper());
+    QFile crcFile(FileName + ".crc");
+    if (crcFile.open(QIODevice::WriteOnly)) {
+        crcFile.write(reinterpret_cast<const char*>(&crc), sizeof(crc));
+        crcFile.close();
     }
-    readFile.close();
-
-    QFile crc(FileName+".crc");
-    if (crc.open(QIODevice::WriteOnly)) {
-        QDataStream crcOut(&crc);
-        crcOut<<summa;
-        crc.close();
-    }
-    ui->ControlSum->setText(QString::number(summa));
 
 }
 
@@ -148,52 +151,55 @@ void MainWindow::checkFile() {
      return;
  }
 
+ QByteArray Data = file.readAll();
+ file.close();
+
  QFile crcfile(fileName+".crc");
  if (!crcfile.open(QIODevice::ReadOnly)) {
      QMessageBox::warning(this, "Error", "cannot open crc file");
      return;
  }
 
- quint32 checkSumma = 0;
- QByteArray data = file.readAll();
- for (char byte : data) {
-     checkSumma +=static_cast<unsigned char>(byte);
- }
- file.seek(0);
-
- QDataStream in(&file);
- rabotniki.clear();
- int k;
- in>>k;
- int number = ui->Number0_255->value();
-
- QDataStream crcIn(&crcfile);
- quint32 storedChecksum;
- crcIn >> storedChecksum;
+ unsigned int CRCFromFile;
+ crcfile.read(reinterpret_cast<char*>(&CRCFromFile), sizeof(CRCFromFile));
  crcfile.close();
 
- if (checkSumma == storedChecksum) {
-     QMessageBox::information(this, "Sucsess", "Control sum is correct");
- } else {
-     QMessageBox::warning(this, "Erorr", "Control sum is not correct");
+ unsigned int CRC = CRC32_function(Data);
+ if (CRCFromFile!=CRC) {
+     QMessageBox::warning(this, "Error", "CRC is not correct");
+     return;
  }
 
+ int number = ui->Number0_255->value();
+ int index = 0;
+ rabotniki.clear();
 
- for (int i=0;i<k;++i) {
-     QByteArray XorData;
-     in>>XorData;
+ int size;
+ memcpy(&size, Data.constData(), sizeof(size));
+ index+=sizeof(size);
 
-     for (char &byte : XorData) {
-         byte ^=number;
+
+ for (int i = 0; i < size; i++) {
+     int length;
+     memcpy(&length, Data.constData() + index, sizeof(length));
+     index += sizeof(length);
+
+     QByteArray newdata = Data.mid(index, length);
+     index += length;
+     for (char &byte : newdata) byte ^= number;
+
+     QList<QByteArray> parts = newdata.split('\0');
+     if (parts.size() < 5) {
+         QMessageBox::warning(this, "Ошибка", "Ошибка структуры данных!");
+         return;
      }
-     QDataStream tempStream(&XorData, QIODevice::ReadOnly);
-     QString name, gender, phone;
-     int age, exp;
-     tempStream >> name >> gender >> age >> exp >> phone;
-     rabotniki.append(QSharedPointer<Emploer>::create(name, gender, age, exp, phone));
+
+ rabotniki.push_back(QSharedPointer<Emploer>::create(parts[0], parts[1], parts[2].toInt(), parts[3].toInt(), parts[4]));
  }
- file.close();
  updateList();
+ ui->ControlSum->setText(QString("CRC32: %1").arg(CRCFromFile, 8, 16, QChar('0')).toUpper());
+      QMessageBox::warning(this, "Message", "CRC is correct");
+
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
